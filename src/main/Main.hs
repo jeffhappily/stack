@@ -837,10 +837,12 @@ newCmd :: (NewOpts,InitOpts) -> RIO Runner ()
 newCmd (newOpts,initOpts) =
     withGlobalProject $ withConfig YesReexec $ do
         dir <- new newOpts (forceOverwrite initOpts)
-        exists <- doesFileExist $ dir </> stackDotYaml
-        when (forceOverwrite initOpts || not exists) $ do
-            go <- view globalOptsL
-            initProject dir initOpts (globalResolver go)
+
+        return ()
+        -- exists <- doesFileExist $ dir </> stackDotYaml
+        -- when (forceOverwrite initOpts || not exists) $ do
+        --     go <- view globalOptsL
+        --     initProject dir initOpts (globalResolver go)
 
 -- | Display instructions for how to use templates
 templatesCmd :: () -> RIO Runner ()

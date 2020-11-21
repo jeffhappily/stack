@@ -13,6 +13,7 @@ module Stack.New
     , NewOpts(..)
     , TemplateName
     , templatesHelp
+    , fetchContentFromRepo
     ) where
 
 import           Stack.Prelude
@@ -31,7 +32,8 @@ import           Data.Time.Calendar
 import           Data.Time.Clock
 import           Network.HTTP.StackClient (VerifiedDownloadException (..), Request, HttpException,
                                            getResponseBody, httpLbs, mkDownloadRequest, parseRequest, parseUrlThrow,
-                                           setForceDownload, setGithubHeaders, verifiedDownloadWithProgress)
+                                           setForceDownload, setGithubHeaders, verifiedDownloadWithProgress, httpJSON)
+import           Network.HTTP.Simple (getResponseStatusCode, getResponseHeader)
 import           Path
 import           Path.IO
 import           Stack.Constants
@@ -43,6 +45,10 @@ import qualified Text.Mustache as Mustache
 import qualified Text.Mustache.Render as Mustache
 import           Text.ProjectTemplate
 
+import qualified Data.Yaml             as Yaml
+import           Data.Aeson            (Value, withObject, (.:))
+import           Data.Aeson.Types      (parseEither)
+import           Data.HashMap.Strict   (lookupDefault)
 --------------------------------------------------------------------------------
 -- Main project creation
 
@@ -59,7 +65,7 @@ data NewOpts = NewOpts
     }
 
 -- | Create a new project with the given options.
-new :: HasConfig env => NewOpts -> Bool -> RIO env (Path Abs Dir)
+new :: (HasConfig env, HasLogFunc env) => NewOpts -> Bool -> RIO env (Path Abs Dir)
 new opts forceOverwrite = do
     when (newOptsProjectName opts `elem` wiredInPackages) $
       throwM $ Can'tUseWiredInName (newOptsProjectName opts)
@@ -72,21 +78,38 @@ new opts forceOverwrite = do
     let template = fromMaybe defaultTemplateName $ asum [ cliOptionTemplate
                                                         , configTemplate
                                                         ]
-    if exists && not bare
-        then throwM (AlreadyExists absDir)
-        else do
-            templateText <- loadTemplate template (logUsing absDir template)
-            files <-
-                applyTemplate
-                    project
-                    template
-                    (newOptsNonceParams opts)
-                    absDir
-                    templateText
-            when (not forceOverwrite && bare) $ checkForOverwrite (M.keys files)
-            writeTemplateFiles files
-            runTemplateInits absDir
-            return absDir
+    t <- loadTemplate template (logUsing absDir template)
+
+    logInfo $ display t
+    
+    throwM (AlreadyExists absDir)
+
+    -- when (newOptsProjectName opts `elem` wiredInPackages) $
+    --   throwM $ Can'tUseWiredInName (newOptsProjectName opts)
+    -- pwd <- getCurrentDir
+    -- absDir <- if bare then return pwd
+    --                   else do relDir <- parseRelDir (packageNameString project)
+    --                           liftM (pwd </>) (return relDir)
+    -- exists <- doesDirExist absDir
+    -- configTemplate <- view $ configL.to configDefaultTemplate
+    -- let template = fromMaybe defaultTemplateName $ asum [ cliOptionTemplate
+    --                                                     , configTemplate
+    --                                                     ]
+    -- if exists && not bare
+    --     then throwM (AlreadyExists absDir)
+    --     else do
+    --         templateText <- loadTemplate template (logUsing absDir template)
+    --         files <-
+    --             applyTemplate
+    --                 project
+    --                 template
+    --                 (newOptsNonceParams opts)
+    --                 absDir
+    --                 templateText
+    --         when (not forceOverwrite && bare) $ checkForOverwrite (M.keys files)
+    --         writeTemplateFiles files
+    --         runTemplateInits absDir
+    --         return absDir
   where
     cliOptionTemplate = newOptsTemplate opts
     project = newOptsProjectName opts
@@ -109,12 +132,13 @@ data TemplateFrom = LocalTemp | RemoteTemp
 
 -- | Download and read in a template's text content.
 loadTemplate
-    :: forall env. HasConfig env
+    :: forall env. (HasConfig env, HasLogFunc env)
     => TemplateName
     -> (TemplateFrom -> RIO env ())
     -> RIO env Text
 loadTemplate name logIt = do
     templateDir <- view $ configL.to templatesDir
+    logInfo $ "I'm in"
     case templatePath name of
         AbsPath absFile -> logIt LocalTemp >> loadLocalFile absFile
         UrlPath s -> downloadFromUrl s templateDir
@@ -124,9 +148,10 @@ loadTemplate name logIt = do
                     logIt LocalTemp
                     return f)
                 (\(e :: NewException) ->
-                      case relRequest rawParam of
-                        Just req -> downloadTemplate req
-                                                     (templateDir </> relFile)
+                      case parseRepoPathWithService defaultRepoService (T.pack rawParam) of
+                        Just repoPath -> downloadTemplate' repoPath (templateDir </> relFile)
+                         -- downloadTemplate req
+                         --                            (templateDir </> relFile)
                         Nothing -> throwM e
                 )
         RepoPath rtp -> do
@@ -163,6 +188,12 @@ loadTemplate name logIt = do
           (useCachedVersionOrThrow path)
 
         loadLocalFile path
+    downloadTemplate' :: RepoTemplatePath -> Path Abs File -> RIO env Text
+    downloadTemplate' repoTemplate path = do
+      content <- fetchContentFromRepo repoTemplate
+      writeFileBinary (toFilePath path) content
+
+      loadLocalFile path
     useCachedVersionOrThrow :: Path Abs File -> VerifiedDownloadException -> RIO env ()
     useCachedVersionOrThrow path exception = do
       exists <- doesFileExist path
@@ -180,6 +211,30 @@ urlFromRepoTemplatePath (RepoTemplatePath Gitlab user name) =
     T.concat ["https://gitlab.com",                "/", user, "/stack-templates/raw/master/", name]
 urlFromRepoTemplatePath (RepoTemplatePath Bitbucket user name) =
     T.concat ["https://bitbucket.org",             "/", user, "/stack-templates/raw/master/", name]
+
+-- | Fetch file content from Repo API
+fetchContentFromRepo :: (HasLogFunc env) => RepoTemplatePath -> RIO env ByteString
+fetchContentFromRepo (RepoTemplatePath Github user name) = do
+    req <- parseRequest $ T.unpack $ T.concat ["https://api.github.com/repos/", user, "/stack-templates/contents/", name]
+    logInfo "URL: "
+    logInfo $ displayShow req
+    response <- httpJSON req
+
+    -- logInfo $ displayShow $ "The status code was: " ++
+    --            show (getResponseStatusCode response)
+
+    let body = getResponseBody response :: Value
+
+    let p = withObject
+            "body"
+            (\obj -> obj .: "content")
+            body
+    case parseEither (const p) () of
+        Left err -> return ""
+        Right content -> do
+            logInfo content
+            return ""
+
 
 -- | Apply and unpack a template into a directory.
 applyTemplate
